@@ -2,8 +2,11 @@ package deltex
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -47,8 +50,8 @@ func TestConnectDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
 	}
-	if db.opts.WriteMode != WriteModeEdge {
-		t.Errorf("Default write mode should be edge, got %s", db.opts.WriteMode)
+	if db.opts.WriteMode != WriteModeSync {
+		t.Errorf("Default write mode should be sync, got %s", db.opts.WriteMode)
 	}
 	if db.url != "https://db.deltex.dev/v1/query" {
 		t.Errorf("Default URL wrong: %s", db.url)
@@ -58,15 +61,15 @@ func TestConnectDefaults(t *testing.T) {
 func TestWithWriteMode(t *testing.T) {
 	t.Setenv("DELTEX_API_KEY", "k")
 	db, _ := Connect(Options{})
-	sync := db.WithWriteMode(WriteModeSync)
-	if sync == db {
+	edge := db.WithWriteMode(WriteModeEdge)
+	if edge == db {
 		t.Error("WithWriteMode should return new client")
 	}
-	if sync.headers["X-Write-Mode"] != "sync" {
-		t.Errorf("X-Write-Mode header wrong: %s", sync.headers["X-Write-Mode"])
+	if edge.headers["X-Write-Mode"] != "edge" {
+		t.Errorf("X-Write-Mode header wrong: %s", edge.headers["X-Write-Mode"])
 	}
-	// Same mode returns same client
-	same := db.WithWriteMode(WriteModeEdge)
+	// Same mode (sync = default) returns same client
+	same := db.WithWriteMode(WriteModeSync)
 	if same != db {
 		t.Error("WithWriteMode same mode should return same client")
 	}
@@ -142,6 +145,60 @@ func TestTransactionCollector(t *testing.T) {
 	}
 }
 
+func TestBatchOneRoundTrip(t *testing.T) {
+	calls := 0
+	var gotStatements []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var body struct {
+			Statements []string `json:"statements"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotStatements = body.Statements
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true,"affected_rows":3}`))
+	}))
+	defer srv.Close()
+
+	t.Setenv("DELTEX_API_KEY", "k")
+	db, err := Connect(Options{Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	n, err := db.Batch(context.Background(), []string{
+		"INSERT INTO t VALUES (1)",
+		"INSERT INTO t VALUES (2)",
+		"INSERT INTO t VALUES (3)",
+	})
+	if err != nil {
+		t.Fatalf("Batch failed: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("Expected 1 round-trip, got %d", calls)
+	}
+	if len(gotStatements) != 3 {
+		t.Errorf("Expected 3 statements sent, got %d", len(gotStatements))
+	}
+	if n != 3 {
+		t.Errorf("Expected 3 rows affected, got %d", n)
+	}
+}
+
+func TestBatchEmptyNoOp(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		_, _ = w.Write([]byte(`{"success":true}`))
+	}))
+	defer srv.Close()
+	t.Setenv("DELTEX_API_KEY", "k")
+	db, _ := Connect(Options{Endpoint: srv.URL})
+	n, err := db.Batch(context.Background(), nil)
+	if err != nil || n != 0 || calls != 0 {
+		t.Errorf("Empty batch should be a no-op: n=%d err=%v calls=%d", n, err, calls)
+	}
+}
+
 func TestFormatParam(t *testing.T) {
 	cases := []struct {
 		input    any
@@ -184,10 +241,18 @@ func TestQueryResult(t *testing.T) {
 		ExecutionMs:  12.5,
 		CommitStatus: CommitStatusEdgeAccepted,
 	}
-	if len(r.Rows) != 1 { t.Error("Expected 1 row") }
-	if r.Columns[0] != "id" { t.Error("Expected 'id' column") }
-	if math.Abs(r.ExecutionMs - 12.5) > 0.001 { t.Errorf("ExecutionMs wrong: %f", r.ExecutionMs) }
-	if r.CommitStatus != CommitStatusEdgeAccepted { t.Errorf("CommitStatus wrong: %s", r.CommitStatus) }
+	if len(r.Rows) != 1 {
+		t.Error("Expected 1 row")
+	}
+	if r.Columns[0] != "id" {
+		t.Error("Expected 'id' column")
+	}
+	if math.Abs(r.ExecutionMs-12.5) > 0.001 {
+		t.Errorf("ExecutionMs wrong: %f", r.ExecutionMs)
+	}
+	if r.CommitStatus != CommitStatusEdgeAccepted {
+		t.Errorf("CommitStatus wrong: %s", r.CommitStatus)
+	}
 }
 
 // time package ref

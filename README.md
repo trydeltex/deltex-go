@@ -53,7 +53,7 @@ func main() {
 db, err := deltex.Connect(deltex.Options{
     APIKey:    "",         // or set DELTEX_API_KEY env var
     Endpoint:  "",         // or set DELTEX_ENDPOINT env var (default: https://db.deltex.dev)
-    WriteMode: deltex.WriteModeEdge, // WriteModeEdge|WriteModeSync|WriteModeAsync
+    WriteMode: deltex.WriteModeSync, // default; WriteModeSync|WriteModeEdge|WriteModeAsync
     Timeout:   30 * time.Second,
     MaxRetries: 3,
     Tag:       "my-service",
@@ -68,6 +68,7 @@ db.QueryOne(ctx, sql, params...)    → (Row, error)  // nil Row if not found
 db.Execute(ctx, sql, params...)     → (int, error)  // rows affected
 db.ExecuteRaw(ctx, sql, params...)  → (*QueryResult, error)
 db.Transaction(ctx, func(tx) error) → error
+db.Batch(ctx, statements []string)  → (int, error)  // atomic, one round-trip
 ```
 
 ### Fluent modifiers (return new *Client)
@@ -89,6 +90,24 @@ err = db.Transaction(ctx, func(tx *deltex.Tx) error {
     return err
 })
 ```
+
+### Batch — fastest bulk write
+
+`Batch` applies a slice of SQL statements in **one round-trip**, committed
+atomically, returning total rows affected:
+
+```go
+n, err := db.Batch(ctx, []string{
+    "INSERT INTO products (name, price) VALUES ('Apple', 0.99)",
+    "INSERT INTO products (name, price) VALUES ('Banana', 0.59)",
+})
+// n == 2
+```
+
+Looping `Execute` makes one durable commit per statement. `Batch` (and a single
+multi-row `INSERT`) coalesce them into one commit — O(1) instead of O(N) — so
+it's far faster for bulk writes. `Batch` takes raw SQL (no parameter binding) —
+for untrusted values, build statements safely or use `Transaction`.
 
 ### QueryResult
 
@@ -118,11 +137,11 @@ if err != nil {
 
 ## Write Modes
 
-| Mode | Latency | Use when |
-|------|---------|----------|
-| `WriteModeEdge` (default) | ~10ms | Normal writes, ASIA/AUS PoPs |
-| `WriteModeSync` | ~350ms | Financial, audit logs |
-| `WriteModeAsync` | ~5ms | High-volume telemetry |
+| Mode | Use when |
+|------|----------|
+| `WriteModeSync` (default) | Everything by default; durable, never loses an acked write |
+| `WriteModeEdge` | Caches, sessions, idempotent upserts — eventual durability |
+| `WriteModeAsync` | High-volume telemetry, fire-and-forget |
 
 ## License
 
@@ -171,7 +190,7 @@ for attempt := 0; attempt < 3; attempt++ {
 db.Strong().Query(ctx, "SELECT balance FROM accounts WHERE id = $1", accountID)
 ```
 
-### Edge mode writes (ASIA/AUS)
+### Edge mode writes
 
 ```go
 db.WithWriteMode(deltex.WriteModeEdge).Execute(ctx, "INSERT INTO events ...")
@@ -179,4 +198,4 @@ db.WithWriteMode(deltex.WriteModeEdge).Execute(ctx, "INSERT INTO events ...")
 
 ## SDK Version
 
-`v1.3.0` — see [CHANGELOG.md](../../CHANGELOG.md) for history.
+`v1.3.1` — see [CHANGELOG.md](../../CHANGELOG.md) for history.

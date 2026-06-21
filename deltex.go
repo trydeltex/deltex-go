@@ -34,17 +34,20 @@ import (
 type Row map[string]any
 
 // Version is the current SDK version.
-const Version = "1.3.0"
+const Version = "1.3.1"
 
 // WriteMode controls how writes are committed.
 type WriteMode string
 
 const (
-	// WriteModeEdge is CAS-protected async (~10ms). Default. Best for ASIA/AUS PoPs.
-	WriteModeEdge WriteMode = "edge"
-	// WriteModeSync waits for KV acknowledgment (~350ms). Strongest durability.
+	// WriteModeSync waits for a durable commit. Default — never loses an
+	// acknowledged write. Batch writes (multi-row INSERT/transaction) to amortize.
 	WriteModeSync WriteMode = "sync"
-	// WriteModeAsync fire-and-forget (~5ms). Best for high-volume telemetry.
+	// WriteModeEdge is CAS-protected async. Acknowledges before the durable
+	// commit lands; a concurrent write from another node can clobber it. Use for
+	// caches, sessions, idempotent upserts — not data that must not be lost.
+	WriteModeEdge WriteMode = "edge"
+	// WriteModeAsync fire-and-forget. Best for high-volume telemetry.
 	WriteModeAsync WriteMode = "async"
 )
 
@@ -59,11 +62,11 @@ const (
 
 // QueryResult is the full result envelope from a query.
 type QueryResult struct {
-	Rows         []Row
-	Columns      []string
-	RowsAffected int
-	ExecutionMs  float64 // 0 if not available
-	CommitStatus CommitStatus
+	Rows          []Row
+	Columns       []string
+	RowsAffected  int
+	ExecutionMs   float64 // 0 if not available
+	CommitStatus  CommitStatus
 	SchemaVersion int
 }
 
@@ -71,10 +74,10 @@ type QueryResult struct {
 
 // Error is returned when the engine reports an error.
 type Error struct {
-	Message      string
-	Status       int    // HTTP status code
-	SQL          string // the query that caused the error
-	EngineMsg    string
+	Message   string
+	Status    int    // HTTP status code
+	SQL       string // the query that caused the error
+	EngineMsg string
 }
 
 func (e *Error) Error() string {
@@ -99,7 +102,7 @@ type Options struct {
 	APIKey string
 	// Endpoint is the engine URL. Defaults to DELTEX_ENDPOINT or https://db.deltex.dev.
 	Endpoint string
-	// WriteMode is the default write mode. Defaults to WriteModeEdge.
+	// WriteMode is the default write mode. Defaults to WriteModeSync (durable).
 	WriteMode WriteMode
 	// Timeout is the HTTP request timeout. Defaults to 30s.
 	Timeout time.Duration
@@ -138,7 +141,7 @@ func Connect(opts Options) (*Client, error) {
 	}
 	opts.Endpoint = strings.TrimRight(opts.Endpoint, "/")
 	if opts.WriteMode == "" {
-		opts.WriteMode = WriteModeEdge
+		opts.WriteMode = WriteModeSync
 	}
 	if opts.Timeout == 0 {
 		opts.Timeout = 30 * time.Second
@@ -287,17 +290,50 @@ func (c *Client) Transaction(ctx context.Context, fn func(tx *Tx) error) error {
 	return nil
 }
 
+// Batch atomically executes a slice of SQL statements in ONE round-trip.
+//
+// The fastest way to apply many writes: the engine coalesces them into a single
+// durable commit, so N statements cost ~one write (O(1)) instead of N separate
+// round-trips. Prefer this — or a single multi-row INSERT — over looping Execute
+// for bulk work. Runs as a transaction (all-or-nothing). Returns total rows
+// affected.
+//
+//	n, err := db.Batch(ctx, []string{
+//	    "INSERT INTO t (id) VALUES (1)",
+//	    "INSERT INTO t (id) VALUES (2)",
+//	})
+func (c *Client) Batch(ctx context.Context, statements []string) (int, error) {
+	if len(statements) == 0 {
+		return 0, nil
+	}
+	body, _ := json.Marshal(map[string]any{
+		"statements": statements,
+		"isolation":  "SERIALIZABLE",
+	})
+	resp, err := c.do(ctx, c.txURL, body)
+	if err != nil {
+		return 0, err
+	}
+	if resp.Success != nil && !*resp.Success {
+		return 0, &Error{Message: resp.Message, Status: 500, SQL: strings.Join(statements, "; ")}
+	}
+	if resp.AffectedRows != 0 {
+		return resp.AffectedRows, nil
+	}
+	return resp.RowsAffected, nil
+}
+
 // ─── HTTP internals ───────────────────────────────────────────────────────────
 
 var timingRE = regexp.MustCompile(`total;dur=([\d.]+)`)
 
 type engineResponse struct {
-	Success      *bool           `json:"success"`
-	Message      string          `json:"message"`
-	Columns      []string        `json:"columns"`
+	Success      *bool            `json:"success"`
+	Message      string           `json:"message"`
+	Columns      []string         `json:"columns"`
 	Rows         []map[string]any `json:"rows"`
-	AffectedRows int             `json:"affected_rows"`
-	RowsAffected int             `json:"rows_affected"`
+	AffectedRows int              `json:"affected_rows"`
+	RowsAffected int              `json:"rows_affected"`
 }
 
 func (c *Client) runQuery(ctx context.Context, sql string) (*QueryResult, error) {
